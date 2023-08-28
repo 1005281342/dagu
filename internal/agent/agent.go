@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/yohamta/dagu/internal/persistence"
+	"github.com/yohamta/dagu/internal/persistence/jsondb"
 	"log"
 	"net/http"
 	"os"
@@ -17,10 +19,10 @@ import (
 	"github.com/yohamta/dagu/internal/constants"
 	"github.com/yohamta/dagu/internal/controller"
 	"github.com/yohamta/dagu/internal/dag"
-	"github.com/yohamta/dagu/internal/database"
 	"github.com/yohamta/dagu/internal/logger"
 	"github.com/yohamta/dagu/internal/mailer"
 	"github.com/yohamta/dagu/internal/models"
+	"github.com/yohamta/dagu/internal/pb"
 	"github.com/yohamta/dagu/internal/reporter"
 	"github.com/yohamta/dagu/internal/scheduler"
 	"github.com/yohamta/dagu/internal/sock"
@@ -36,8 +38,7 @@ type Agent struct {
 	graph        *scheduler.ExecutionGraph
 	logManager   *logManager
 	reporter     *reporter.Reporter
-	database     *database.Database
-	dbManager    *dbManager
+	historyStore persistence.HistoryStore
 	socketServer *sock.Server
 	requestId    string
 }
@@ -51,11 +52,6 @@ type AgentConfig struct {
 // RetryConfig contains the configuration for retrying a workflow.
 type RetryConfig struct {
 	Status *models.Status
-}
-
-type dbManager struct {
-	dbFile   string
-	dbWriter *database.Writer
 }
 
 // Run starts the workflow execution.
@@ -162,18 +158,37 @@ func (a *Agent) signal(sig os.Signal, allowOverride bool) {
 
 func (a *Agent) init() {
 	logDir := path.Join(a.DAG.LogDir, utils.ValidFilename(a.DAG.Name, "_"))
+	config := &scheduler.Config{
+		LogDir:        logDir,
+		MaxActiveRuns: a.DAG.MaxActiveRuns,
+		Delay:         a.DAG.Delay,
+		Dry:           a.Dry,
+		RequestId:     a.requestId,
+	}
+
+	if a.DAG.HandlerOn.Exit != nil {
+		onExit, _ := pb.ToPbStep(a.DAG.HandlerOn.Exit)
+		config.OnExit = onExit
+	}
+
+	if a.DAG.HandlerOn.Success != nil {
+		onSuccess, _ := pb.ToPbStep(a.DAG.HandlerOn.Success)
+		config.OnSuccess = onSuccess
+	}
+
+	if a.DAG.HandlerOn.Failure != nil {
+		onFailure, _ := pb.ToPbStep(a.DAG.HandlerOn.Failure)
+		config.OnFailure = onFailure
+	}
+
+	if a.DAG.HandlerOn.Cancel != nil {
+		onCancel, _ := pb.ToPbStep(a.DAG.HandlerOn.Cancel)
+		config.OnCancel = onCancel
+	}
+
 	a.scheduler = &scheduler.Scheduler{
-		Config: &scheduler.Config{
-			LogDir:        logDir,
-			MaxActiveRuns: a.DAG.MaxActiveRuns,
-			Delay:         a.DAG.Delay,
-			Dry:           a.Dry,
-			OnExit:        a.DAG.HandlerOn.Exit,
-			OnSuccess:     a.DAG.HandlerOn.Success,
-			OnFailure:     a.DAG.HandlerOn.Failure,
-			OnCancel:      a.DAG.HandlerOn.Cancel,
-			RequestId:     a.requestId,
-		}}
+		Config: config,
+	}
 	a.reporter = &reporter.Reporter{
 		Config: &reporter.Config{
 			Mailer: &mailer.Mailer{
@@ -222,14 +237,13 @@ func (a *Agent) setupRequestId() error {
 }
 
 func (a *Agent) setupDatabase() error {
-	a.database = database.New()
-	utils.LogErr("clean old history data", a.database.RemoveOld(a.DAG.Location, a.DAG.HistRetentionDays))
-
-	dbWriter, dbFile, err := a.database.NewWriter(a.DAG.Location, time.Now(), a.requestId)
-	if err != nil {
+	a.historyStore = jsondb.New()
+	if err := a.historyStore.RemoveOld(a.DAG.Location, a.DAG.HistRetentionDays); err != nil {
+		utils.LogErr("clean old history data", err)
+	}
+	if err := a.historyStore.Open(a.DAG.Location, time.Now(), a.requestId); err != nil {
 		return err
 	}
-	a.dbManager = &dbManager{dbFile, dbWriter}
 	return nil
 }
 
@@ -263,17 +277,13 @@ func (a *Agent) run(ctx context.Context) error {
 		tl.Close()
 	}()
 
-	if err := a.dbManager.dbWriter.Open(); err != nil {
-		return err
-	}
-
 	defer func() {
-		if err := a.dbManager.dbWriter.Close(); err != nil {
-			log.Printf("failed to close db writer: %v", err)
+		if err := a.historyStore.Close(); err != nil {
+			log.Printf("failed to close history store: %v", err)
 		}
 	}()
 
-	utils.LogErr("write status", a.dbManager.dbWriter.Write(a.Status()))
+	utils.LogErr("write status", a.historyStore.Write(a.Status()))
 
 	listen := make(chan error)
 	go func() {
@@ -297,14 +307,14 @@ func (a *Agent) run(ctx context.Context) error {
 	go func() {
 		for node := range done {
 			status := a.Status()
-			utils.LogErr("write status", a.dbManager.dbWriter.Write(status))
+			utils.LogErr("write status", a.historyStore.Write(status))
 			utils.LogErr("report step", a.reporter.ReportStep(a.DAG, status, node))
 		}
 	}()
 
 	go func() {
 		time.Sleep(time.Millisecond * 100)
-		utils.LogErr("write status", a.dbManager.dbWriter.Write(a.Status()))
+		utils.LogErr("write status", a.historyStore.Write(a.Status()))
 	}()
 
 	ctx = dag.NewContext(ctx, a.DAG)
@@ -313,13 +323,11 @@ func (a *Agent) run(ctx context.Context) error {
 	status := a.Status()
 
 	log.Println("schedule finished.")
-	utils.LogErr("write status", a.dbManager.dbWriter.Write(a.Status()))
+	utils.LogErr("write status", a.historyStore.Write(a.Status()))
 
 	a.reporter.ReportSummary(status, lastErr)
 	utils.LogErr("send email", a.reporter.SendMail(a.DAG, status, lastErr))
-
-	utils.LogErr("close data file", a.dbManager.dbWriter.Close())
-	utils.LogErr("data compaction", a.database.Compact(a.DAG.Location, a.dbManager.dbFile))
+	utils.LogErr("close data file", a.historyStore.Close())
 
 	return lastErr
 }
@@ -351,7 +359,7 @@ func (a *Agent) dryRun() error {
 }
 
 func (a *Agent) checkIsRunning() error {
-	status, err := controller.NewDAGController(a.DAG).GetStatus()
+	status, err := controller.New(a.DAG, jsondb.New()).GetStatus()
 	if err != nil {
 		return err
 	}

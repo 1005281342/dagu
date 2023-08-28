@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.4
-FROM alpine:latest
+FROM --platform=$BUILDPLATFORM alpine:latest
 
 ARG TARGETARCH
-ARG VERSION=1.3.15 
-ARG RELEASES_URL="https://github.com/yohamta/dagu/releases"
+ARG VERSION=1.10.5 
+ARG RELEASES_URL="https://github.com/dagu-dev/dagu/releases"
 
 ARG USER="dagu"
 ARG USER_UID=1000
@@ -24,13 +24,7 @@ EOF
 USER dagu
 WORKDIR /home/dagu
 RUN <<EOF
-    #dagu binary setup
-    if [ "${TARGETARCH}" == "amd64" ]; then 
-        arch="x86_64";
-    else 
-        arch="${TARGETARCH}"
-    fi
-    export TARGET_FILE="dagu_${VERSION}_Linux_${arch}.tar.gz"
+    export TARGET_FILE="dagu_${VERSION}_Linux_${TARGETARCH}.tar.gz"
     wget ${RELEASES_URL}/download/v${VERSION}/${TARGET_FILE}
     tar -xf ${TARGET_FILE} && rm *.tar.gz 
     sudo mv dagu /usr/local/bin/ 
